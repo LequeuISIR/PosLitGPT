@@ -3,7 +3,7 @@
 import logging
 import re
 
-from litgpt.api import LLM
+from litgpt.api import LLM, PosLLM
 from litgpt.config import Config
 from litgpt.model import GPT  # needs to be imported before config
 from litgpt.prompts import PromptStyle
@@ -20,6 +20,7 @@ logging.getLogger("torch.distributed.fsdp._debug_utils").disabled = True
 
 __all__ = [
     "LLM",
+    "PosLLM",
     "GPT",
     "Config",
     "PromptStyle",
