@@ -16,6 +16,25 @@ import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
+from litgpt.pe import (
+    BasePositionalEncoding,
+    build_positional_encoding,
+)
+from litgpt.pe import (
+    StandardRoPE as StandardRoPE,
+)
+from litgpt.pe import (
+    apply_rope as apply_rope,
+)
+from litgpt.pe import (
+    apply_rope_interleave as apply_rope_interleave,
+)
+from litgpt.pe import (
+    build_rope_cache as build_rope_cache,
+)
+from litgpt.pe import (
+    yarn_get_mscale as yarn_get_mscale,
+)
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
 
@@ -26,15 +45,41 @@ class GPT(nn.Module):
         self.config = config
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
+        self.pe = build_positional_encoding(config)
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
+                h=nn.ModuleList(
+                    Block(config, block_idx, pe=build_positional_encoding(config))
+                    for block_idx in range(config.n_layer)
+                ),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
         self.mask_cache: torch.Tensor | None = None
         self.max_seq_length = self.config.block_size
+
+    @property
+    def cos(self) -> torch.Tensor | None:
+        return getattr(self.pe, "cos", None)
+
+    @cos.setter
+    def cos(self, value: torch.Tensor | None) -> None:
+        if hasattr(self, "pe"):
+            self.pe.cos = value
+        else:
+            self.__dict__["cos"] = value
+
+    @property
+    def sin(self) -> torch.Tensor | None:
+        return getattr(self.pe, "sin", None)
+
+    @sin.setter
+    def sin(self, value: torch.Tensor | None) -> None:
+        if hasattr(self, "pe"):
+            self.pe.sin = value
+        else:
+            self.__dict__["sin"] = value
 
     @property
     def max_seq_length(self) -> int:
@@ -52,14 +97,12 @@ class GPT(nn.Module):
                 " This is likely because the input text exceeds the supported context length of this model."
             )
         self._max_seq_length = value
-        if not hasattr(self, "cos"):
+        if not hasattr(self.pe, "cos") or self.pe.cos is None:
             # first call
-            cos, sin = self.rope_cache()
-            self.register_buffer("cos", cos, persistent=False)
-            self.register_buffer("sin", sin, persistent=False)
+            self.pe.reset_parameters(value)
         # override
-        elif value != self.cos.size(0):
-            self.cos, self.sin = self.rope_cache(device=self.cos.device)
+        elif value != self.pe.cos.size(0):
+            self.pe.reset_parameters(value, device=self.pe.cos.device)
         # the mask and kv cache size will get updated on `set_kv_cache`. we cannot update it here because we don't know
         # if the kv cache is expected
         if self.mask_cache is not None and self.mask_cache.shape[-1] < value:
@@ -68,8 +111,9 @@ class GPT(nn.Module):
             )
 
     def reset_parameters(self) -> None:
-        # Trigger resetting the rope-cache
-        self.cos, self.sin = self.rope_cache(device=self.cos.device)
+        # Trigger resetting the positional encoding cache
+        device = self.pe.cos.device if (hasattr(self.pe, "cos") and self.pe.cos is not None) else None
+        self.pe.reset_parameters(self.max_seq_length, device=device)
 
     def _init_weights(self, module: nn.Module) -> None:
         """Meant to be used with `gpt.apply(gpt._init_weights)`."""
@@ -86,29 +130,36 @@ class GPT(nn.Module):
         self,
         idx: torch.Tensor,
         input_pos: torch.Tensor | None = None,
-        input_pos_maxp1: int | None = None,
+        input_pos_maxp1: int | torch.Tensor | tuple[int, ...] | list[int] | None = None,
         lm_head_chunk_size: int = 0,
+        cache_pos: torch.Tensor | None = None,
+        rope_pos: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """
-        If `input_pos` is provided, the KV cache uses K and V vectors for
-        positions smaller than entries in `input_pos`. For efficiency, pass
-        `input_pos_maxp1` as `max(input_pos) + 1` if already available from
+        If `input_pos` (or `cache_pos`) is provided, the KV cache uses K and V vectors for
+        positions smaller than entries in `cache_pos`. For efficiency, pass
+        `input_pos_maxp1` as `max(cache_pos) + 1` if already available from
         your forward algorithm. This slices the KV cache buffers and speeds
         up multi-head attention.
 
         Without `input_pos_maxp1`, the computation uses the full KV cache
         (`max_seq_length`) with masking applied. Note that inferring
-        `input_pos_maxp1` from `input_pos` causes graph breaks and prevents
+        `input_pos_maxp1` from `cache_pos` causes graph breaks and prevents
         compilation.
 
         Args:
             idx: Token indices of input sequences, shape `(B, T)`, where `B`
                 is batch size.
-            input_pos: Optional. Positions of input tokens. The default is
-                `arange(T)`. Can have shape `(T,)` or `(B, T)` (batched index).
-            input_pos_maxp1: Optional. See above.
+            input_pos: Optional. Positions of input tokens (used for both cache
+                and RoPE if `cache_pos`/`rope_pos` are not explicitly provided).
+                Can have shape `(T,)`, `(T, 1)`, `(B, T)`, or `(B, T, 1)`.
+            input_pos_maxp1: Optional. Physical memory bound (`int` or length-1
+                collection/tensor for L=1).
             lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
                 `lm_head` computation is done in chunks of this size.
+            cache_pos: Optional. Physical 1D slot index in KV-cache.
+            rope_pos: Optional. Position coordinates for RoPE. Can have shape
+                `(T,)`, `(T, 1)`, `(B, T)`, or `(B, T, 1)` for L=1.
 
         Returns:
             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
@@ -121,38 +172,51 @@ class GPT(nn.Module):
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
 
-        if input_pos is not None:  # use the kv cache
-            if input_pos.dim() > 2:
-                # otherwise, things go wrong in `apply_rope`
-                raise ValueError(f"input_pos must have 1 or 2 dimensions, input_pos.shape = {input_pos.shape}")
-            if input_pos.shape[-1] != T:
-                raise ValueError(f"input_pos.shape[-1] = {input_pos.shape[-1]} != {T} = idx.shape[1], must be the same")
-            cos = batched_index_select(self.cos, 0, input_pos)
-            sin = batched_index_select(self.sin, 0, input_pos)
-            if input_pos.dim() == 1:
-                cos = cos.unsqueeze(0)
-                sin = sin.unsqueeze(0)
+        # Decouple / resolve cache_pos and rope_pos
+        if cache_pos is None and input_pos is not None:
+            cache_pos = input_pos
+        if rope_pos is None and input_pos is not None:
+            rope_pos = input_pos
+
+        # Normalize input_pos_maxp1 if given as tuple/list/tensor of length 1 (L=1 case)
+        if input_pos_maxp1 is not None and not isinstance(input_pos_maxp1, int):
+            if isinstance(input_pos_maxp1, torch.Tensor):
+                input_pos_maxp1 = (
+                    int(input_pos_maxp1.item()) if input_pos_maxp1.numel() == 1 else int(input_pos_maxp1[0].item())
+                )
+            elif isinstance(input_pos_maxp1, (list, tuple)) and len(input_pos_maxp1) > 0:
+                input_pos_maxp1 = int(input_pos_maxp1[0])
+
+        if cache_pos is not None:  # use the kv cache
+            # If cache_pos has shape (T, 1) or (B, T, 1) (L=1 case), squeeze the trailing dimension
+            if cache_pos.dim() >= 2 and cache_pos.shape[-1] == 1:
+                cache_pos = cache_pos.squeeze(-1)
+
+            if cache_pos.dim() > 2:
+                raise ValueError(f"cache_pos must have 1 or 2 dimensions, cache_pos.shape = {cache_pos.shape}")
+            if cache_pos.shape[-1] != T:
+                raise ValueError(f"cache_pos.shape[-1] = {cache_pos.shape[-1]} != {T} = idx.shape[1], must be the same")
+
             if self.mask_cache is None:
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
-            mask = batched_index_select(self.mask_cache, 2, input_pos)
+            mask = batched_index_select(self.mask_cache, 2, cache_pos)
             if mask.dim() > 4:
                 # the mask cache has a batch dim of 1 in addition to the one
-                # we get if input_pos has a batch dimension
+                # we get if cache_pos has a batch dimension
                 mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
             if input_pos_maxp1 is not None:
-                # Shorten final dimension so it just covers all `input_pos` entries
+                # Shorten final dimension so it just covers all `cache_pos` entries
                 if input_pos_maxp1 > self.max_seq_length:
-                    raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
+                    raise ValueError(f"Positions in 'input_pos_maxp1' must be in [0,{self.max_seq_length})")
                 mask = mask[..., :input_pos_maxp1]
         else:
-            # unsqueeze to have a batch dimension
-            cos = self.cos[:T].unsqueeze(0)
-            sin = self.sin[:T].unsqueeze(0)
-            # `cos`, `sin` have shape (1, T, config.rope_n_elem)
             mask = None  # defaults to causal mask
             input_pos_maxp1 = None
 
+        cos, sin = self.pe.get_cos_sin(rope_pos, seq_len=T, device=idx.device)
+
         x = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
+        x = self.pe.apply_to_embeddings(x, pos=rope_pos)
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
@@ -163,11 +227,20 @@ class GPT(nn.Module):
                     cos[..., self.config.rope_indices[block_idx]],
                     sin[..., self.config.rope_indices[block_idx]],
                     mask,
-                    input_pos,
-                    input_pos_maxp1,
+                    input_pos=cache_pos,
+                    input_pos_maxp1=input_pos_maxp1,
+                    cache_pos=cache_pos,
                 )
             else:
-                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+                x = block(
+                    x,
+                    cos,
+                    sin,
+                    mask,
+                    input_pos=cache_pos,
+                    input_pos_maxp1=input_pos_maxp1,
+                    cache_pos=cache_pos,
+                )
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -185,78 +258,7 @@ class GPT(nn.Module):
         return cls(Config.from_name(name, **kwargs))
 
     def rope_cache(self, device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.config.rope_adjustments is None:
-            extra_config = None
-
-        else:
-            # Check for mutually exclusive parameter sets
-            llama3_params = ["low_freq_factor", "high_freq_factor"]
-            yarn_params = ["beta_fast", "beta_slow"]
-
-            has_llama3 = any(param in self.config.rope_adjustments for param in llama3_params)
-            has_yarn = any(param in self.config.rope_adjustments for param in yarn_params)
-
-            if has_llama3 and has_yarn:
-                raise ValueError(
-                    "RoPE adjustments cannot contain both Llama3 parameters (low_freq_factor, high_freq_factor) "
-                    "and YaRN parameters (beta_fast, beta_slow). These are mutually exclusive."
-                )
-
-            # Llama3-style RoPE
-            if has_llama3:
-                adjusted_params_required = ["factor", "low_freq_factor", "high_freq_factor", "original_max_seq_len"]
-                params_present = [param in self.config.rope_adjustments for param in adjusted_params_required]
-                if all(params_present):
-                    extra_config = {name: self.config.rope_adjustments[name] for name in adjusted_params_required}
-                else:
-                    missing_params = [
-                        param for param, present in zip(adjusted_params_required, params_present) if not present
-                    ]
-                    raise ValueError(
-                        f"The following Llama3 RoPE parameters are missing in rope_adjustments: {', '.join(missing_params)}. "
-                        "All Llama3 parameters must be specified together."
-                    )
-
-            # YaRN-style RoPE
-            elif has_yarn:
-                # Required: factor, beta_fast, beta_slow, original_max_seq_len
-                # Optional: mscale, mscale_all_dim
-                yarn_required_params = ["factor", "beta_fast", "beta_slow", "original_max_seq_len"]
-                params_present = [param in self.config.rope_adjustments for param in yarn_required_params]
-
-                if not all(params_present):
-                    missing_params = [
-                        param for param, present in zip(yarn_required_params, params_present) if not present
-                    ]
-                    raise ValueError(
-                        f"The following YaRN RoPE parameters are missing in rope_adjustments: {', '.join(missing_params)}. "
-                        "All YaRN required parameters must be specified together."
-                    )
-
-                extra_config = {name: self.config.rope_adjustments[name] for name in yarn_required_params}
-
-                # Add optional YaRN parameters
-                for param in ["mscale", "mscale_all_dim"]:
-                    if param in self.config.rope_adjustments:
-                        extra_config[param] = self.config.rope_adjustments[param]
-
-            # Linear or standard RoPE
-            elif "factor" in self.config.rope_adjustments:
-                # linear RoPE
-                adjusted_params_required = ["factor"]
-                extra_config = {name: self.config.rope_adjustments[name] for name in adjusted_params_required}
-            else:
-                extra_config = None  # uses standard RoPE
-
-        return build_rope_cache(
-            seq_len=self.max_seq_length,
-            n_elem=self.config.rope_n_elem,
-            device=device,
-            condense_ratio=self.config.rope_condense_ratio,
-            base=self.config.rope_base,
-            extra_config=extra_config,
-            rope_local_base_freq=self.config.rope_local_base_freq,
-        )
+        return self.pe.rope_cache(seq_len=self.max_seq_length, device=device)
 
     def rope_cache_length(self) -> int:
         """
@@ -311,6 +313,7 @@ class Block(nn.Module):
         self,
         config: Config,
         block_idx: int,
+        pe: BasePositionalEncoding | None = None,
     ) -> None:
         super().__init__()
         if not config.parallel_residual and config.shared_attention_norm:
@@ -320,10 +323,11 @@ class Block(nn.Module):
             )
 
         self.norm_1 = nn.Identity() if not config.norm_1 else config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.pe = pe if pe is not None else build_positional_encoding(config)
         self.attn = (
-            CausalSelfAttention(config, block_idx)
+            CausalSelfAttention(config, block_idx, pe=self.pe)
             if not config.latent_attention
-            else MultiheadLatentAttention(config, block_idx)
+            else MultiheadLatentAttention(config, block_idx, pe=self.pe)
         )
         self.post_attention_norm = (
             config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_attention_norm else nn.Identity()
@@ -349,7 +353,8 @@ class Block(nn.Module):
         sin: torch.Tensor,
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
-        input_pos_maxp1: int | None = None,
+        input_pos_maxp1: int | torch.Tensor | tuple[int, ...] | list[int] | None = None,
+        cache_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -371,9 +376,28 @@ class Block(nn.Module):
         |     ↓
         └───► +
         """
+        if cache_pos is None:
+            cache_pos = input_pos
+        if cache_pos is not None and cache_pos.dim() >= 2 and cache_pos.shape[-1] == 1:
+            cache_pos = cache_pos.squeeze(-1)
+        if input_pos_maxp1 is not None and not isinstance(input_pos_maxp1, int):
+            if isinstance(input_pos_maxp1, torch.Tensor):
+                input_pos_maxp1 = (
+                    int(input_pos_maxp1.item()) if input_pos_maxp1.numel() == 1 else int(input_pos_maxp1[0].item())
+                )
+            elif isinstance(input_pos_maxp1, (list, tuple)) and len(input_pos_maxp1) > 0:
+                input_pos_maxp1 = int(input_pos_maxp1[0])
 
         x_normed = self.norm_1(x)
-        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1)
+        attention_output = self.attn(
+            x_normed,
+            cos,
+            sin,
+            mask,
+            input_pos=cache_pos,
+            input_pos_maxp1=input_pos_maxp1,
+            cache_pos=cache_pos,
+        )
         attention_output = self.post_attention_norm(attention_output)
 
         if self.config.parallel_residual:
@@ -388,8 +412,14 @@ class Block(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: Config, block_idx: int) -> None:
+    def __init__(
+        self,
+        config: Config,
+        block_idx: int,
+        pe: BasePositionalEncoding | None = None,
+    ) -> None:
         super().__init__()
+        self.pe = pe if pe is not None else build_positional_encoding(config)
         # key, query and value projections for all heads, but in a batch
         self.qkv = nn.Linear(
             config.n_embd,
@@ -434,7 +464,8 @@ class CausalSelfAttention(nn.Module):
         sin: torch.Tensor,
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
-        input_pos_maxp1: int | None = None,
+        input_pos_maxp1: int | torch.Tensor | tuple[int, ...] | list[int] | None = None,
+        cache_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
@@ -461,6 +492,18 @@ class CausalSelfAttention(nn.Module):
         #   n_query_groups=4       n_query_groups=2      n_query_groups=1
         #
         # credit https://arxiv.org/pdf/2305.13245.pdf
+        if cache_pos is None:
+            cache_pos = input_pos
+        if cache_pos is not None and cache_pos.dim() >= 2 and cache_pos.shape[-1] == 1:
+            cache_pos = cache_pos.squeeze(-1)
+        if input_pos_maxp1 is not None and not isinstance(input_pos_maxp1, int):
+            if isinstance(input_pos_maxp1, torch.Tensor):
+                input_pos_maxp1 = (
+                    int(input_pos_maxp1.item()) if input_pos_maxp1.numel() == 1 else int(input_pos_maxp1[0].item())
+                )
+            elif isinstance(input_pos_maxp1, (list, tuple)) and len(input_pos_maxp1) > 0:
+                input_pos_maxp1 = int(input_pos_maxp1[0])
+
         head_size = self.config.head_size
         n_head = self.config.n_head
         n_query_groups = self.config.n_query_groups
@@ -503,20 +546,13 @@ class CausalSelfAttention(nn.Module):
             k = self.norm_k(k)
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
-        if self.config.rope_interleave:
-            q_roped = apply_rope_interleave(q[..., :rope_n_elem], cos, sin)
-            k_roped = apply_rope_interleave(k[..., :rope_n_elem], cos, sin)
-        else:
-            q_roped = apply_rope(q[..., :rope_n_elem], cos, sin)
-            k_roped = apply_rope(k[..., :rope_n_elem], cos, sin)
-        q = torch.cat((q_roped, q[..., rope_n_elem:]), dim=-1)  # (B, nh_q, T, hs)
-        k = torch.cat((k_roped, k[..., rope_n_elem:]), dim=-1)  # (B, nh_k, T, hs)
+        q, k = self.pe.apply_rotary(q, k, cos, sin)
 
         # Apply kv-cache during inference.
-        if input_pos is not None:
+        if cache_pos is not None:
             if not isinstance(self.kv_cache, KVCache):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
-            k, v = self.kv_cache(input_pos, k, v)
+            k, v = self.kv_cache(cache_pos, k, v)
 
             if self.apply_sliding_window_attention:
                 actual_kv_len = k.size(2)
@@ -533,7 +569,7 @@ class CausalSelfAttention(nn.Module):
         # Grouped queries: balance the number of heads across all three matrices.
         # NOTE: flash attention requires it in training mode.
         # Multi-query: this step can be skipped since there is only 1 head, allowing us to use broadcasting.
-        if n_query_groups != n_head and (input_pos is None or n_query_groups != 1):
+        if n_query_groups != n_head and (cache_pos is None or n_query_groups != 1):
             q_per_kv = n_head // n_query_groups
             k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
             v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
@@ -647,8 +683,9 @@ class CausalSelfAttention(nn.Module):
 
 
 class MultiheadLatentAttention(nn.Module):
-    def __init__(self, config: Config, block_idx: int) -> None:
+    def __init__(self, config: Config, block_idx: int, pe: BasePositionalEncoding | None = None) -> None:
         super().__init__()
+        self.pe = pe if pe is not None else build_positional_encoding(config)
 
         self.q_a_proj = nn.Linear(config.n_embd, config.q_lora_rank, bias=config.attn_bias)
         self.q_a_norm = RMSNorm(config.q_lora_rank, eps=config.norm_eps)
@@ -689,7 +726,8 @@ class MultiheadLatentAttention(nn.Module):
         sin: torch.Tensor,
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
-        input_pos_maxp1: int | None = None,
+        input_pos_maxp1: int | torch.Tensor | tuple[int, ...] | list[int] | None = None,
+        cache_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
@@ -700,6 +738,18 @@ class MultiheadLatentAttention(nn.Module):
         # - nh_(q,k,v) | number of heads for query, key and value
         # - n_query_groups = nh_k = nh_v | number of query groups sharing key and value heads
         # alternative notation: num_kv_groups = n_query_groups
+        if cache_pos is None:
+            cache_pos = input_pos
+        if cache_pos is not None and cache_pos.dim() >= 2 and cache_pos.shape[-1] == 1:
+            cache_pos = cache_pos.squeeze(-1)
+        if input_pos_maxp1 is not None and not isinstance(input_pos_maxp1, int):
+            if isinstance(input_pos_maxp1, torch.Tensor):
+                input_pos_maxp1 = (
+                    int(input_pos_maxp1.item()) if input_pos_maxp1.numel() == 1 else int(input_pos_maxp1[0].item())
+                )
+            elif isinstance(input_pos_maxp1, (list, tuple)) and len(input_pos_maxp1) > 0:
+                input_pos_maxp1 = int(input_pos_maxp1[0])
+
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         q = self.q_b_proj(self.q_a_norm(self.q_a_proj(x)))  # (B, T, n_head * qk_head_dim)
@@ -730,10 +780,10 @@ class MultiheadLatentAttention(nn.Module):
         k = torch.cat((k_pass, k_roped), dim=-1)
 
         # Apply kv-cache during inference.
-        if input_pos is not None:
+        if cache_pos is not None:
             if not isinstance(self.kv_cache, KVCache):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
-            k, v = self.kv_cache(input_pos, k, v)
+            k, v = self.kv_cache(cache_pos, k, v)
             if input_pos_maxp1 is not None:
                 # Subselect along sequence dimension
                 k = k[..., :input_pos_maxp1, :]
@@ -744,7 +794,7 @@ class MultiheadLatentAttention(nn.Module):
         # Grouped queries: balance the number of heads across all three matrices.
         # NOTE: flash attention requires it in training mode.
         # Multi-query: this step can be skipped since there is only 1 head, allowing us to use broadcasting.
-        if self.config.n_query_groups != self.config.n_head and (input_pos is None or self.config.n_query_groups != 1):
+        if self.config.n_query_groups != self.config.n_head and (cache_pos is None or self.config.n_query_groups != 1):
             q_per_kv = self.config.n_head // self.config.n_query_groups
             k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
             v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
@@ -929,149 +979,6 @@ class GroupedTopkRouter(nn.Module):
         return topk_weights, topk_indices
 
 
-# ROPE: YaRN (Yet another RoPE extensioN) scaling function for extended context
-def yarn_get_mscale(scale=1, mscale=1):
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def build_rope_cache(
-    seq_len: int,
-    n_elem: int,
-    device: torch.device | None = None,
-    base: int = 10000,
-    condense_ratio: int = 1,
-    extra_config: dict | None = None,
-    rope_local_base_freq: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Enhanced Transformer with Rotary Position Embedding.
-
-    Args:
-        seq_len (int): Sequence length.
-        n_elem (int): Number of elements (head dimension).
-        device (torch.device, optional): Device for tensor allocations.
-        base (int, optional): Base for computing inverse frequencies.
-        condense_ratio (int, optional): Ratio to condense the position indices.
-        extra_config (dict, optional): Configuration parameters for frequency adjustments (used by Llama 3.1 and 3.2)
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Cosine and sine caches for RoPE.
-            Shapes are `(seq_len, n_elem)`.
-    """
-
-    # Compute the inverse frequencies theta
-    theta = 1.0 / (base ** (torch.arange(0, n_elem, 2, device=device).float() / n_elem))
-
-    # Initialize attention scaling factor (modified for YaRN)
-    attention_scaling = 1.0
-
-    if extra_config is not None:
-        factor = extra_config["factor"]
-        # Check YaRN first (has beta_fast/beta_slow)
-        if "beta_fast" in extra_config or "beta_slow" in extra_config:
-            # YaRN-style RoPE scaling
-            beta_fast = extra_config["beta_fast"]
-            beta_slow = extra_config["beta_slow"]
-            original_max_seq_len = extra_config["original_max_seq_len"]
-
-            # Calculate attention scaling factor based on mscale and mscale_all_dim
-            mscale = extra_config.get("mscale")
-            mscale_all_dim = extra_config.get("mscale_all_dim")
-            if mscale and mscale_all_dim:
-                attention_scaling = yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)
-            elif mscale_all_dim:
-                attention_scaling = yarn_get_mscale(factor, mscale_all_dim)
-            elif mscale:
-                attention_scaling = yarn_get_mscale(factor, mscale)
-            # else: attention_scaling remains 1.0
-
-            # Create two frequency sets: extrapolation (unscaled) and interpolation (scaled)
-            pos_freqs = base ** (torch.arange(0, n_elem, 2, device=device).float() / n_elem)
-            theta_extrapolation = 1.0 / pos_freqs
-            theta_interpolation = 1.0 / (factor * pos_freqs)
-
-            # Find correction range based on rotation counts
-            # Inverse dimension formula to find dimension based on number of rotations
-            def find_correction_dim(num_rotations, dim, base_val, max_pos):
-                return (dim * math.log(max_pos / (num_rotations * 2 * math.pi))) / (2 * math.log(base_val))
-
-            low_dim = find_correction_dim(beta_fast, n_elem, base, original_max_seq_len)
-            high_dim = find_correction_dim(beta_slow, n_elem, base, original_max_seq_len)
-
-            # Apply truncation if specified
-            if extra_config.get("truncate", True):
-                low_dim = math.floor(low_dim)
-                high_dim = math.ceil(high_dim)
-
-            low_dim = max(low_dim, 0)
-            high_dim = min(high_dim, n_elem // 2 - 1)
-
-            # Create linear ramp factor for blending
-            dim_range = torch.arange(n_elem // 2, device=device, dtype=torch.float32)
-            if low_dim == high_dim:
-                high_dim += 0.001  # Prevent singularity
-
-            linear_func = (dim_range - low_dim) / (high_dim - low_dim)
-            ramp_func = torch.clamp(linear_func, 0.0, 1.0)
-
-            # Blend extrapolation and interpolation frequencies
-            # ramp_func = 0 -> use interpolation (scaled), ramp_func = 1 -> use extrapolation (unscaled)
-            theta_extrapolation_factor = ramp_func
-            theta = (
-                theta_interpolation * (1 - theta_extrapolation_factor)
-                + theta_extrapolation * theta_extrapolation_factor
-            )
-        elif "original_max_seq_len" in extra_config:
-            # Llama3-style RoPE scaling
-            orig_context_len = extra_config["original_max_seq_len"]
-            low_freq_factor = extra_config["low_freq_factor"]
-            high_freq_factor = extra_config["high_freq_factor"]
-
-            wavelen = 2 * torch.pi / theta
-            ratio = orig_context_len / wavelen
-            smooth_factor = (ratio - low_freq_factor) / (high_freq_factor - low_freq_factor)
-            smooth_factor = torch.clamp(smooth_factor, min=0.0, max=1.0)
-
-            # Compute adjusted_theta without masked indexing
-            adjusted_theta = (1 - smooth_factor) * (theta / factor) + smooth_factor * theta
-            theta = adjusted_theta
-        else:
-            # Linear scaling fallback
-            theta = theta / factor
-
-    # Create position indices `[0, 1, ..., seq_len - 1]`
-    seq_idx = torch.arange(seq_len, device=device).float() / condense_ratio
-
-    # Calculate the product of position index and $\theta_i$
-    idx_theta = torch.outer(seq_idx, theta).repeat(1, 2)
-    # If `n_elem` is odd, the final dimension of `idx_theta` has size
-    # `n_elem + 1`, so need to cut something off.
-    # Due to a current bug in Hugging Face, in the case `n_elem == 1`, we leave
-    # `idx_theta`, `cos`, `sin` as is. Things work out in `apply_rope` due to
-    # broadcasting. If we shorten `idx_theta`, unit tests comparing to
-    # Hugging Face fail.
-    # https://github.com/huggingface/transformers/issues/35233
-    if idx_theta.shape[-1] > n_elem > 1:
-        idx_theta = idx_theta[..., :n_elem]
-
-    # if rope_local_base_freq is given, have a separate rope value for local embedding
-    # For now, we use default RoPE for local embedding
-    if rope_local_base_freq is not None:
-        local_theta = 1.0 / (rope_local_base_freq ** (torch.arange(0, n_elem, 2, device=device).float() / n_elem))
-        local_idx_theta = torch.outer(seq_idx, local_theta)
-        local_idx_theta = local_idx_theta.repeat(1, 2)
-        if local_idx_theta.shape[-1] > n_elem > 1:
-            local_idx_theta = local_idx_theta[..., :n_elem]
-
-        idx_theta = torch.stack((idx_theta, local_idx_theta), dim=-1)
-
-    cos = torch.cos(idx_theta) * attention_scaling
-    sin = torch.sin(idx_theta) * attention_scaling
-    return cos, sin
-
-
 def batched_index_select(t, dim, idx):
     """index_select for batched index and unbatched t"""
     if idx.dim() == 1:
@@ -1139,79 +1046,6 @@ def batched_index_copy_(t, dim, idx, val):
             unbatched_dim = dim if dim < 0 else dim - 1
             t[i].index_copy_(unbatched_dim, idx[i], val[i])
         return t
-
-
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """
-    Applies RoPE transform to `x`. Note that `cos`, `sin` need to have a batch
-    dimension.
-
-    Args:
-        x: Input tensor, `(B, ..., T, head_size)`
-        cos: Cached cosines, `(B, T, head_size)` or `(1, T, head_size)`
-        sin: Cached sines, `(B, T, head_size)` or `(1, T, head_size)`
-
-    Returns:
-        Encoded tensor, `(B, ..., T, head_size)`
-    """
-    if cos.dim() != 3:
-        raise ValueError(f"cos must be three-dimensional, but shape is {cos.shape}")
-    if cos.shape != sin.shape:
-        raise ValueError(f"cos, sin must have same shape, but cos.shape={cos.shape}, sin.shape={sin.shape}")
-    head_size_half = x.size(-1) // 2
-    x1 = x[..., :head_size_half]  # (B, ..., T, head_size/2)
-    x2 = x[..., head_size_half:]  # (B, ..., T, head_size/2)
-    rotated = torch.cat((-x2, x1), dim=-1)  # (B, ..., T, head_size)
-    dims_diff = x.dim() - cos.dim()
-    if dims_diff > 0:
-        # Ensure that shapes of `x`, `cos`, `sin` align
-        new_shape = cos.shape[0:1] + (1,) * dims_diff + cos.shape[1:]
-        cos = cos.view(*new_shape)
-        sin = sin.view(*new_shape)
-
-    roped = (x * cos) + (rotated * sin)
-    return roped.to(dtype=x.dtype)
-
-
-def apply_rope_interleave(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply rotary position embeddings with interleaved tensor layout.
-
-    This version rearranges the input tensor to group even/odd indices separately
-    before applying the standard RoPE rotation, matching HuggingFace's
-    apply_rotary_pos_emb_interleave behavior.
-
-    Args:
-        x: Input tensor of shape (..., seq_len, head_dim)
-        cos: Cosine component of shape (B, seq_len, head_dim) or (1, seq_len, head_dim)
-        sin: Sine component of shape (B, seq_len, head_dim) or (1, seq_len, head_dim)
-
-    Returns:
-        Tensor with RoPE applied, same shape as input
-    """
-    if cos.dim() != 3:
-        raise ValueError(f"cos must be three-dimensional, but shape is {cos.shape}")
-    if cos.shape != sin.shape:
-        raise ValueError(f"cos, sin must have same shape, but cos.shape={cos.shape}, sin.shape={sin.shape}")
-
-    # Rearrange tensor to group even/odd indices: [x0,x1,x2,x3,...] -> [x0,x2,x4,...,x1,x3,x5,...]
-    *batch_dims, d = x.shape
-    x = x.view(*batch_dims, d // 2, 2).transpose(-1, -2).reshape(*batch_dims, d)
-
-    # Standard rotation logic (same as apply_rope)
-    head_size_half = x.size(-1) // 2
-    x1 = x[..., :head_size_half]
-    x2 = x[..., head_size_half:]
-    rotated = torch.cat((-x2, x1), dim=-1)
-
-    # Auto-detect dimension mismatch and reshape cos/sin
-    dims_diff = x.dim() - cos.dim()
-    if dims_diff > 0:
-        new_shape = cos.shape[0:1] + (1,) * dims_diff + cos.shape[1:]
-        cos = cos.view(*new_shape)
-        sin = sin.view(*new_shape)
-
-    roped = (x * cos) + (rotated * sin)
-    return roped.to(dtype=x.dtype)
 
 
 def do_softcapping(x: torch.Tensor, thresh: float) -> torch.Tensor:

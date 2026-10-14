@@ -85,6 +85,9 @@ class Config:
     rope_condense_ratio: int = 1
     rope_adjustments: dict | None = None
     rope_interleave: bool = False
+    # Positional encoding configuration
+    pe_type: str = "standard_rope"
+    pe_config: dict | None = None
     # Transformer block (MLP)
     intermediate_size: int | None = None
     moe_intermediate_size: int | None = None
