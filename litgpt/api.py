@@ -617,7 +617,6 @@ class LLM(torch.nn.Module):
         return outputs, benchmark_dict
 
 
-
 class PosLLM(torch.nn.Module):
     def __init__(
         self,
@@ -644,6 +643,10 @@ class PosLLM(torch.nn.Module):
         self.kv_cache_initialized = kv_cache_initialized
         self.fixed_kv_cache_size = fixed_kv_cache_size
         self.prev_generated_seq_length = 0
+        self.last_token_doc_ids: torch.Tensor | None = None
+        self.last_doc_token_positions: torch.Tensor | None = None
+        self.last_prompt: str | None = None
+        self.last_styled_prompt: str | None = None
 
     """
     LLM model class for inference, pretraining, and finetuning.
@@ -1044,7 +1047,7 @@ class PosLLM(torch.nn.Module):
     @torch.inference_mode()
     def generate(
         self,
-        prompt: str,
+        prompt: str | None = None,
         sys_prompt: str | None = None,
         max_new_tokens: int = 50,
         temperature: float = 1.0,
@@ -1052,43 +1055,36 @@ class PosLLM(torch.nn.Module):
         top_p: float = 1.0,
         return_as_token_ids: bool = False,
         stream: bool = False,
-    ) -> str | torch.Tensor:
-        """
-        Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
+        segments: list[tuple[str, int | None]] | None = None,
+        doc_char_spans: list[tuple[int, int]] | list[tuple[int, int, int]] | None = None,
+        return_token_doc_ids: bool = False,
+    ) -> str | torch.Tensor | tuple[str | torch.Tensor, torch.Tensor]:
+        """Takes a conditioning sequence (prompt or segments) and generates output tokens.
 
         Arguments:
-            model: The model to use.
-            prompt: The prompt string to use for generating the samples.
-            sys_prompt: The system prompt string to use for generating the samples.
-                The system prompt allows the user to provide additional instructions to shape all responses by providing additional context, behavioral guidelines, style, and constraints.
+            prompt: The prompt string to use for generating samples (optional if segments is provided).
+            sys_prompt: The system prompt string to shape responses.
             max_new_tokens: The maximum number of new tokens to return.
             temperature: Scales the predicted logits by 1 / temperature.
-            top_k: If specified, only sample among the tokens with the k highest probabilities.
-            top_p: If specified, it represents the cumulative probability threshold to consider in the sampling process.
-                In top-p sampling, the next token is sampled from the highest probability tokens
-                whose cumulative probability exceeds the threshold `top_p`. When specified,
-                it must be `0 <= top_p <= 1`. Here, `top_p=0` is equivalent
-                to sampling the most probable token, while `top_p=1` samples from the whole distribution.
-                It can be used in conjunction with `top_k` and `temperature` with the following order
-                of application:
-
-                1. `top_k` sampling
-                2. `temperature` scaling
-                3. `top_p` sampling
-
-                For more details, see https://arxiv.org/abs/1904.09751
-                or https://huyenchip.com/2024/01/16/sampling.html#top_p
-            return_as_token_ids: If True, returns the token IDs as a torch.Tensor. Otherwise, returns the decoded text as a string.
-            stream: If True, returns a generator that yields tokens as they are generated.
-                At the moment, this setting is slower and may use more memory than the non-streaming version.
-                We plan to resolve this in the future.
+            top_k: If specified, only sample among top k probabilities.
+            top_p: Cumulative probability threshold for top-p sampling.
+            return_as_token_ids: If True, returns token IDs instead of decoded string.
+            stream: If True, yields tokens as a generator.
+            segments: Optional list of (text_chunk, doc_id) tuples. None or -1 denotes non-document.
+            doc_char_spans: Optional list of (start_char, end_char) or (start, end, doc_id) character spans.
+            return_token_doc_ids: If True, returns (outputs, token_doc_ids).
         """
         if self.model is None:
             raise AttributeError(
                 "The model is not initialized yet; use the .distribute() "
                 "or .trainer_setup() method to initialize the model."
             )
-        input_ids = self._text_to_token_ids(prompt, sys_prompt)
+        input_ids, token_doc_ids_tensor, styled_prompt = self._prepare_prompt_and_doc_ids(
+            prompt=prompt,
+            segments=segments,
+            doc_char_spans=doc_char_spans,
+            sys_prompt=sys_prompt,
+        )
         prompt_length = input_ids.size(0)
         max_returned_tokens = prompt_length + max_new_tokens
 
@@ -1145,11 +1141,138 @@ class PosLLM(torch.nn.Module):
             )
 
         if stream:
-            return outputs
+            result = outputs
         elif return_as_token_ids:
-            return outputs
+            result = outputs
         else:
-            return self.preprocessor.decode(outputs)
+            result = self.preprocessor.decode(outputs)
+
+        if return_token_doc_ids:
+            return result, token_doc_ids_tensor
+        return result
+
+    def _extract_token_offsets(self, text: str, full_tokens: list[int]) -> list[tuple[int, int]]:
+        """Extracts character (start, end) offsets for each token in text."""
+        tok = self.preprocessor.tokenizer
+        token_offsets: list[tuple[int, int]] = []
+
+        if tok.backend == "huggingface":
+            encoding = tok.processor.encode(text)
+            hf_offsets = encoding.offsets
+            # Check if BOS token was added to full_tokens by tokenizer.encode
+            if len(full_tokens) == len(hf_offsets) + 1 and tok.bos_id is not None and full_tokens[0] == tok.bos_id:
+                token_offsets.append((0, 0))
+            token_offsets.extend(hf_offsets)
+            # Check if EOS token was appended
+            if len(full_tokens) == len(token_offsets) + 1 and tok.eos_id is not None and full_tokens[-1] == tok.eos_id:
+                token_offsets.append((len(text), len(text)))
+
+        elif tok.backend == "sentencepiece":
+            pieces = tok.processor.encode_as_pieces(text)
+            sp_offsets: list[tuple[int, int]] = []
+            char_cursor = 0
+            for p in pieces:
+                piece_str = p.replace("\u2581", " ")
+                if not piece_str:
+                    sp_offsets.append((char_cursor, char_cursor))
+                    continue
+                pos = text.find(piece_str, char_cursor)
+                if pos != -1:
+                    sp_offsets.append((pos, pos + len(piece_str)))
+                    char_cursor = pos + len(piece_str)
+                else:
+                    sp_offsets.append((char_cursor, min(char_cursor + len(piece_str), len(text))))
+                    char_cursor = min(char_cursor + len(piece_str), len(text))
+
+            if len(full_tokens) == len(sp_offsets) + 1 and tok.bos_id is not None and full_tokens[0] == tok.bos_id:
+                token_offsets.append((0, 0))
+            token_offsets.extend(sp_offsets)
+            if len(full_tokens) == len(token_offsets) + 1 and tok.eos_id is not None and full_tokens[-1] == tok.eos_id:
+                token_offsets.append((len(text), len(text)))
+
+        # Fallback padding if offset length doesn't match full_tokens
+        if len(token_offsets) < len(full_tokens):
+            token_offsets.extend([(0, 0)] * (len(full_tokens) - len(token_offsets)))
+        elif len(token_offsets) > len(full_tokens):
+            token_offsets = token_offsets[: len(full_tokens)]
+
+        return token_offsets
+
+    def _prepare_prompt_and_doc_ids(
+        self,
+        prompt: str | None = None,
+        segments: list[tuple[str, int | None]] | None = None,
+        doc_char_spans: list[tuple[int, int]] | list[tuple[int, int, int]] | None = None,
+        sys_prompt: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, str]:
+        """Prepares input token IDs, token-to-document ID tensor, and styled prompt string."""
+        if prompt is None:
+            if segments is None:
+                raise ValueError("Either 'prompt' or 'segments' must be provided.")
+            parts = []
+            parsed_spans = []
+            curr_pos = 0
+            for seg_text, d_id in segments:
+                seg_len = len(seg_text)
+                if d_id is not None and d_id >= 0:
+                    parsed_spans.append((curr_pos, curr_pos + seg_len, int(d_id)))
+                curr_pos += seg_len
+                parts.append(seg_text)
+            prompt = "".join(parts)
+            normalized_spans = parsed_spans
+        else:
+            normalized_spans = []
+            if doc_char_spans is not None:
+                for i, span in enumerate(doc_char_spans):
+                    if len(span) == 2:
+                        normalized_spans.append((span[0], span[1], i))
+                    elif len(span) == 3:
+                        normalized_spans.append((span[0], span[1], int(span[2])))
+                    else:
+                        raise ValueError(f"Invalid span format: {span}. Expected (start, end) or (start, end, doc_id).")
+
+        # Apply prompt style
+        styled_prompt = self.prompt_style.apply(prompt, sys_prompt=sys_prompt)
+        if normalized_spans and styled_prompt != prompt:
+            shift = styled_prompt.find(prompt)
+            if shift > 0:
+                normalized_spans = [(s + shift, e + shift, d_id) for s, e, d_id in normalized_spans]
+
+        input_ids = self.preprocessor.encode(styled_prompt)
+        device = input_ids.device
+        num_tokens = input_ids.size(0)
+
+        if normalized_spans:
+            full_tokens = input_ids.tolist()
+            token_offsets = self._extract_token_offsets(styled_prompt, full_tokens)
+            doc_id_list = []
+            for tok_start, tok_end in token_offsets:
+                matched_doc = -1
+                if tok_start < tok_end:
+                    for d_start, d_end, d_id in normalized_spans:
+                        if max(tok_start, d_start) < min(tok_end, d_end):
+                            matched_doc = d_id
+                            break
+                doc_id_list.append(matched_doc)
+            token_doc_ids_tensor = torch.tensor(doc_id_list, dtype=torch.int64, device=device)
+        else:
+            token_doc_ids_tensor = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
+
+        # Compute intra-document positions: for each doc_id >= 0, local position starts from 0
+        doc_token_positions = torch.zeros_like(token_doc_ids_tensor)
+        counts: dict[int, int] = {}
+        for idx, d_id in enumerate(token_doc_ids_tensor.tolist()):
+            if d_id >= 0:
+                pos = counts.get(d_id, 0)
+                doc_token_positions[idx] = pos
+                counts[d_id] = pos + 1
+
+        self.last_token_doc_ids = token_doc_ids_tensor
+        self.last_doc_token_positions = doc_token_positions
+        self.last_prompt = prompt
+        self.last_styled_prompt = styled_prompt
+
+        return input_ids, token_doc_ids_tensor, styled_prompt
 
     def _text_to_token_ids(self, prompt: str, sys_prompt: str | None = None) -> torch.Tensor:
         """Utility method to convert a prompt text to token IDs"""
@@ -1198,7 +1321,6 @@ class PosLLM(torch.nn.Module):
                 )
 
         return outputs, benchmark_dict
-
 
 
 class Preprocessor:
