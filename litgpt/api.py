@@ -153,6 +153,7 @@ class LLM(torch.nn.Module):
         tokenizer_dir: Path | None = None,
         access_token: str | None = None,
         distribute: Literal["auto"] | None = "auto",
+        config_overrides: dict[str, Any] | None = None,
     ) -> "LLM":
         """
         Loads the LLM from a local directory or model hub.
@@ -169,6 +170,8 @@ class LLM(torch.nn.Module):
             distribute: If "auto" (default), initializes the model on a single GPU if available and otherwise on the CPU.
                 To have more control over the model distribution strategy and utilize multiple GPUs, you can set
                 `llm = LLM.load(..., distribute=None)` and call `llm.distribute(...)` manually.
+            config_overrides: Optional dictionary of configuration overrides to apply to the
+                loaded model config (e.g., {"pe_type": "multirope"}).
         """
 
         allowed_init = {"pretrained", "random"}
@@ -191,6 +194,16 @@ class LLM(torch.nn.Module):
 
         else:
             raise ValueError(f"Invalid init option: {init}. Must be one of {allowed_init}")
+
+        if config_overrides is not None:
+            for k, v in config_overrides.items():
+                if hasattr(config, k):
+                    setattr(config, k, v)
+                else:
+                    raise ValueError(f"Unknown config attribute: {k}")
+            config.__post_init__()
+            if "rope_n_elem" in config_overrides:
+                config.rope_n_elem = config_overrides["rope_n_elem"]
 
         torch.set_float32_matmul_precision("high")
 
@@ -739,7 +752,8 @@ class PosLLM(torch.nn.Module):
         tokenizer_dir: Path | None = None,
         access_token: str | None = None,
         distribute: Literal["auto"] | None = "auto",
-    ) -> "LLM":
+        config_overrides: dict[str, Any] | None = None,
+    ) -> "PosLLM":
         """
         Loads the LLM from a local directory or model hub.
 
@@ -755,6 +769,8 @@ class PosLLM(torch.nn.Module):
             distribute: If "auto" (default), initializes the model on a single GPU if available and otherwise on the CPU.
                 To have more control over the model distribution strategy and utilize multiple GPUs, you can set
                 `llm = LLM.load(..., distribute=None)` and call `llm.distribute(...)` manually.
+            config_overrides: Optional dictionary of configuration overrides to apply to the
+                loaded model config (e.g., {"pe_type": "multirope"}).
         """
 
         allowed_init = {"pretrained", "random"}
@@ -777,6 +793,16 @@ class PosLLM(torch.nn.Module):
 
         else:
             raise ValueError(f"Invalid init option: {init}. Must be one of {allowed_init}")
+
+        if config_overrides is not None:
+            for k, v in config_overrides.items():
+                if hasattr(config, k):
+                    setattr(config, k, v)
+                else:
+                    raise ValueError(f"Unknown config attribute: {k}")
+            config.__post_init__()
+            if "rope_n_elem" in config_overrides:
+                config.rope_n_elem = config_overrides["rope_n_elem"]
 
         torch.set_float32_matmul_precision("high")
 

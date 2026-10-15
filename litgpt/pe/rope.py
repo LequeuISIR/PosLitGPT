@@ -292,28 +292,29 @@ class StandardRoPE(BasePositionalEncoding):
 
     def get_cos_sin(
         self,
-        rope_pos: torch.Tensor | None,
+        pe_pos: torch.Tensor | None,
         seq_len: int,
         device: torch.device | None = None,
+        batch_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Resolves cos and sin for the forward step given rope_pos or default sequential slicing."""
-        if rope_pos is not None:
+        """Resolves cos and sin for the forward step given pe_pos or default sequential slicing."""
+        if pe_pos is not None:
             # Squeeze trailing L=1 dimension if present
-            if rope_pos.dim() >= 2 and rope_pos.shape[-1] == 1:
-                rope_pos_1d = rope_pos.squeeze(-1)
+            if pe_pos.dim() >= 2 and pe_pos.shape[-1] == 1:
+                pe_pos_1d = pe_pos.squeeze(-1)
             else:
-                rope_pos_1d = rope_pos
+                pe_pos_1d = pe_pos
 
-            if rope_pos_1d.dim() > 2:
+            if pe_pos_1d.dim() > 2:
                 raise ValueError(
-                    f"rope_pos must have 1 or 2 dimensions (or (..., 1) for L=1), rope_pos.shape = {rope_pos.shape}"
+                    f"pe_pos must have 1 or 2 dimensions (or (..., 1) for L=1), pe_pos.shape = {pe_pos.shape}"
                 )
-            if rope_pos_1d.shape[-1] != seq_len:
-                raise ValueError(f"rope_pos.shape[-1] = {rope_pos_1d.shape[-1]} != {seq_len}, must be the same")
+            if pe_pos_1d.shape[-1] != seq_len:
+                raise ValueError(f"pe_pos.shape[-1] = {pe_pos_1d.shape[-1]} != {seq_len}, must be the same")
 
-            cos = batched_index_select(self.cos, 0, rope_pos_1d)
-            sin = batched_index_select(self.sin, 0, rope_pos_1d)
-            if rope_pos_1d.dim() == 1:
+            cos = batched_index_select(self.cos, 0, pe_pos_1d)
+            sin = batched_index_select(self.sin, 0, pe_pos_1d)
+            if pe_pos_1d.dim() == 1:
                 cos = cos.unsqueeze(0)
                 sin = sin.unsqueeze(0)
         else:

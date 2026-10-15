@@ -28,11 +28,12 @@ class BasePositionalEncoding(nn.Module, ABC):
     @abstractmethod
     def get_cos_sin(
         self,
-        rope_pos: torch.Tensor | None,
+        pe_pos: torch.Tensor | None,
         seq_len: int,
         device: torch.device | None = None,
+        batch_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (cos, sin) tensors for the given rope_pos or sequential prefill slice."""
+        """Returns (cos, sin) tensors for the given pe_pos or sequential prefill slice."""
         pass
 
     @abstractmethod
@@ -49,7 +50,7 @@ class BasePositionalEncoding(nn.Module, ABC):
     def get_attention_bias_or_mask(
         self,
         cache_pos: torch.Tensor | None = None,
-        rope_pos: torch.Tensor | None = None,
+        pe_pos: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Hook for relative biases (ALiBi) or document-isolation attention masks."""

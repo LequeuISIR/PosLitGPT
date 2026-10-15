@@ -133,7 +133,7 @@ class GPT(nn.Module):
         input_pos_maxp1: int | torch.Tensor | tuple[int, ...] | list[int] | None = None,
         lm_head_chunk_size: int = 0,
         cache_pos: torch.Tensor | None = None,
-        rope_pos: torch.Tensor | None = None,
+        pe_pos: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """
         If `input_pos` (or `cache_pos`) is provided, the KV cache uses K and V vectors for
@@ -151,15 +151,15 @@ class GPT(nn.Module):
             idx: Token indices of input sequences, shape `(B, T)`, where `B`
                 is batch size.
             input_pos: Optional. Positions of input tokens (used for both cache
-                and RoPE if `cache_pos`/`rope_pos` are not explicitly provided).
+                and PE if `cache_pos`/`pe_pos` are not explicitly provided).
                 Can have shape `(T,)`, `(T, 1)`, `(B, T)`, or `(B, T, 1)`.
             input_pos_maxp1: Optional. Physical memory bound (`int` or length-1
                 collection/tensor for L=1).
             lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
                 `lm_head` computation is done in chunks of this size.
             cache_pos: Optional. Physical 1D slot index in KV-cache.
-            rope_pos: Optional. Position coordinates for RoPE. Can have shape
-                `(T,)`, `(T, 1)`, `(B, T)`, or `(B, T, 1)` for L=1.
+            pe_pos: Optional. Position coordinates for positional encoding. Can have shape
+                `(T,)`, `(T, L)`, `(B, T)`, or `(B, T, L)`.
 
         Returns:
             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
@@ -172,11 +172,23 @@ class GPT(nn.Module):
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
 
-        # Decouple / resolve cache_pos and rope_pos
+        # Decouple / resolve cache_pos and pe_pos
+        if pe_pos is None and input_pos is not None:
+            pe_pos = input_pos
         if cache_pos is None and input_pos is not None:
-            cache_pos = input_pos
-        if rope_pos is None and input_pos is not None:
-            rope_pos = input_pos
+            # If input_pos has multi-coordinate positions (dim > 2 or (T, L) with L > 1),
+            # fallback cache_pos to standard 1D sequential positions [0..T-1]
+            if input_pos.dim() > 2 and input_pos.shape[-1] > 1:
+                cache_pos = torch.arange(T, device=input_pos.device)
+            elif (
+                input_pos.dim() == 2
+                and input_pos.shape[0] == T
+                and input_pos.shape[1] > 1
+                and input_pos.shape[0] != idx.shape[0]
+            ):
+                cache_pos = torch.arange(T, device=input_pos.device)
+            else:
+                cache_pos = input_pos
 
         # Normalize input_pos_maxp1 if given as tuple/list/tensor of length 1 (L=1 case)
         if input_pos_maxp1 is not None and not isinstance(input_pos_maxp1, int):
@@ -213,10 +225,10 @@ class GPT(nn.Module):
             mask = None  # defaults to causal mask
             input_pos_maxp1 = None
 
-        cos, sin = self.pe.get_cos_sin(rope_pos, seq_len=T, device=idx.device)
+        cos, sin = self.pe.get_cos_sin(pe_pos, seq_len=T, device=idx.device, batch_size=idx.size(0))
 
         x = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
-        x = self.pe.apply_to_embeddings(x, pos=rope_pos)
+        x = self.pe.apply_to_embeddings(x, pos=pe_pos)
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
