@@ -35,6 +35,7 @@ def generate(
     top_k: int | None = None,
     top_p: float = 1.0,
     stop_tokens: tuple[list[int], ...] = (),
+    pe_pos: torch.Tensor | None = None,
 ) -> Iterator[torch.Tensor]:
     """Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as possible.
 
@@ -59,6 +60,7 @@ def generate(
             For more details, see https://arxiv.org/abs/1904.09751
             or https://huyenchip.com/2024/01/16/sampling.html#top_p
         stop_tokens: If specified, stop generating any more token once one of this list is generated.
+        pe_pos: Optional multi-coordinate or semantic position tensor (T, L) for positional embeddings.
     """
     from litgpt.generate.base import generate_fn
 
@@ -72,6 +74,7 @@ def generate(
         top_k=top_k,
         top_p=top_p,
         stop_tokens=stop_tokens,
+        pe_pos=pe_pos,
     )
 
 

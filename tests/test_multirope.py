@@ -408,3 +408,179 @@ def test_posllm_load_with_invalid_config_override():
             distribute=None,
             config_overrides={"nonexistent_setting_xyz": True},
         )
+
+
+def test_posllm_generate_multirope_transfer():
+    """Test 10: PosLLM.generate() constructs (T, 2) pe_pos when intra_document_pe=True."""
+    phi_dir = Path("checkpoints/microsoft/phi-2")
+    if not phi_dir.exists():
+        pytest.skip("checkpoints/microsoft/phi-2 not found")
+
+    llm = PosLLM.load(
+        model="phi-2",
+        init="random",
+        tokenizer_dir=phi_dir,
+        distribute="auto",
+        config_overrides={"pe_type": "multirope", "rotary_percentage": 0.5},
+    )
+
+    segments = [
+        ("Context: ", None),
+        ("The capital of France is Paris.", 0),
+        (" Question: What is the capital of France?", None),
+    ]
+
+    # intra_document_pe=True -> [global_pos, intra_doc_pos]
+    output = llm.generate(segments=segments, max_new_tokens=5, intra_document_pe=True)
+    assert isinstance(output, str)
+    assert len(output) > 0
+
+    assert llm.last_pe_pos is not None
+    assert llm.last_pe_pos.dim() == 2
+    assert llm.last_pe_pos.shape[-1] == 2
+    prompt_len = llm.last_pe_pos.shape[0]
+
+    # Coordinate 0 is sequential global index
+    expected_global = torch.arange(prompt_len, device=llm.last_pe_pos.device)
+    torch.testing.assert_close(llm.last_pe_pos[:, 0], expected_global)
+
+    # Coordinate 1 matches last_doc_token_positions
+    torch.testing.assert_close(llm.last_pe_pos[:, 1], llm.last_doc_token_positions.to(llm.last_pe_pos.device))
+
+
+def test_posllm_generate_custom_pe_pos():
+    """Test 11: PosLLM.generate() accepts caller-supplied custom pe_pos."""
+    phi_dir = Path("checkpoints/microsoft/phi-2")
+    if not phi_dir.exists():
+        pytest.skip("checkpoints/microsoft/phi-2 not found")
+
+    llm = PosLLM.load(
+        model="phi-2",
+        init="random",
+        tokenizer_dir=phi_dir,
+        distribute="auto",
+        config_overrides={"pe_type": "multirope", "rotary_percentage": 0.5},
+    )
+
+    prompt = "Hello world"
+    styled_prompt = llm.prompt_style.apply(prompt)
+    input_ids = llm.preprocessor.encode(styled_prompt)
+    custom_pe_pos = torch.stack((torch.arange(len(input_ids)), torch.zeros(len(input_ids), dtype=torch.int64)), dim=-1)
+
+    output = llm.generate(prompt=prompt, pe_pos=custom_pe_pos, max_new_tokens=4)
+    assert isinstance(output, str)
+    assert llm.last_pe_pos is not None
+    torch.testing.assert_close(llm.last_pe_pos.cpu(), custom_pe_pos)
+
+    # Verify error is raised when pe_pos length does not match prompt_length
+    bad_pe_pos = torch.zeros((len(input_ids) + 5, 2), dtype=torch.int64)
+    with pytest.raises(ValueError, match="does not match prompt length"):
+        llm.generate(prompt=prompt, pe_pos=bad_pe_pos)
+
+
+def test_posllm_generate_multirope_stream():
+    """Test 12: PosLLM.generate() with stream=True works seamlessly with multirope."""
+    phi_dir = Path("checkpoints/microsoft/phi-2")
+    if not phi_dir.exists():
+        pytest.skip("checkpoints/microsoft/phi-2 not found")
+
+    llm = PosLLM.load(
+        model="phi-2",
+        init="random",
+        tokenizer_dir=phi_dir,
+        distribute="auto",
+        config_overrides={"pe_type": "multirope", "rotary_percentage": 0.5},
+    )
+
+    segments = [
+        ("Doc: ", None),
+        ("Quantum physics is fascinating.", 0),
+        (" Q: What is fascinating?", None),
+    ]
+
+    stream_gen = llm.generate(segments=segments, max_new_tokens=5, stream=True, intra_document_pe=True)
+    chunks = list(stream_gen)
+    assert len(chunks) > 0
+    assert all(isinstance(c, str) for c in chunks)
+    assert llm.last_pe_pos is not None
+    assert llm.last_pe_pos.shape[-1] == 2
+
+
+def test_posllm_generate_indexing_combinations():
+    """Test 13: All combinations of document_pe and intra_document_pe."""
+    phi_dir = Path("checkpoints/microsoft/phi-2")
+    if not phi_dir.exists():
+        pytest.skip("checkpoints/microsoft/phi-2 not found")
+
+    # rotary_percentage = 0.25 allows L=3 without exceeding budget (3 * 0.25 = 0.75 <= 1.0)
+    llm = PosLLM.load(
+        model="phi-2",
+        init="random",
+        tokenizer_dir=phi_dir,
+        distribute="auto",
+        config_overrides={"pe_type": "multirope", "rotary_percentage": 0.25},
+    )
+
+    segments = [
+        ("Prefix: ", None),
+        ("Document content A.", 0),
+        (" Middle: ", None),
+        ("Document content B.", 1),
+    ]
+
+    # Combination 1: Both False -> standard initial indexing (pe_pos is None)
+    out1 = llm.generate(segments=segments, max_new_tokens=4, document_pe=False, intra_document_pe=False)
+    assert isinstance(out1, str)
+    assert llm.last_pe_pos is None
+
+    # Combination 2: document_pe=True, intra_document_pe=False -> (T, 2) [global, doc_id]
+    out2 = llm.generate(segments=segments, max_new_tokens=4, document_pe=True, intra_document_pe=False)
+    assert isinstance(out2, str)
+    assert llm.last_pe_pos is not None
+    assert llm.last_pe_pos.shape[-1] == 2
+    # Verify non-doc is 0 and docs are 1, 2...
+    expected_doc_ids = torch.where(
+        llm.last_token_doc_ids >= 0,
+        llm.last_token_doc_ids + 1,
+        torch.zeros_like(llm.last_token_doc_ids),
+    ).to(llm.last_pe_pos.device)
+    torch.testing.assert_close(llm.last_pe_pos[:, 1], expected_doc_ids)
+
+    # Combination 3: document_pe=False, intra_document_pe=True -> (T, 2) [global, intra_doc]
+    out3 = llm.generate(segments=segments, max_new_tokens=4, document_pe=False, intra_document_pe=True)
+    assert isinstance(out3, str)
+    assert llm.last_pe_pos is not None
+    assert llm.last_pe_pos.shape[-1] == 2
+    torch.testing.assert_close(llm.last_pe_pos[:, 1], llm.last_doc_token_positions.to(llm.last_pe_pos.device))
+
+    # Combination 4: Both True -> (T, 3) [global, doc_id, intra_doc]
+    out4 = llm.generate(segments=segments, max_new_tokens=4, document_pe=True, intra_document_pe=True)
+    assert isinstance(out4, str)
+    assert llm.last_pe_pos is not None
+    assert llm.last_pe_pos.shape[-1] == 3
+    # Check coords 0, 1, 2
+    prompt_len = llm.last_pe_pos.shape[0]
+    torch.testing.assert_close(llm.last_pe_pos[:, 0], torch.arange(prompt_len, device=llm.last_pe_pos.device))
+    torch.testing.assert_close(llm.last_pe_pos[:, 1], expected_doc_ids)
+    torch.testing.assert_close(llm.last_pe_pos[:, 2], llm.last_doc_token_positions.to(llm.last_pe_pos.device))
+
+
+def test_posllm_generate_standard_rope_rejects_multicoord_pe():
+    """Test 14: document_pe or intra_document_pe on a standard_rope model raises ValueError."""
+    phi_dir = Path("checkpoints/microsoft/phi-2")
+    if not phi_dir.exists():
+        pytest.skip("checkpoints/microsoft/phi-2 not found")
+
+    llm = PosLLM.load(
+        model="phi-2",
+        init="random",
+        tokenizer_dir=phi_dir,
+        distribute="auto",
+        config_overrides={"pe_type": "standard_rope"},
+    )
+
+    with pytest.raises(ValueError, match="require a multi-coordinate positional embedding"):
+        llm.generate("Hello world", document_pe=True)
+
+    with pytest.raises(ValueError, match="require a multi-coordinate positional embedding"):
+        llm.generate("Hello world", intra_document_pe=True)

@@ -79,9 +79,10 @@ def next_token(
     input_pos: torch.Tensor,
     x: torch.Tensor,
     input_pos_maxp1: int | None = None,
+    pe_pos: torch.Tensor | None = None,
     **sample_kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    logits = model(x, input_pos, input_pos_maxp1=input_pos_maxp1)
+    logits = model(x, input_pos=input_pos, input_pos_maxp1=input_pos_maxp1, pe_pos=pe_pos)
     _next = sample(logits, **sample_kwargs).to(dtype=torch.int64)
     return _next
 
@@ -93,7 +94,13 @@ def batched_sample(logits: list[torch.Tensor], kwargs: list[dict]) -> torch.Tens
     )
 
 
-def batched_next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, kwargs: dict | list[dict]) -> torch.Tensor:
+def batched_next_token(
+    model: GPT,
+    input_pos: torch.Tensor,
+    x: torch.Tensor,
+    kwargs: dict | list[dict],
+    pe_pos: torch.Tensor | None = None,
+) -> torch.Tensor:
     # Where:
     # input_pos is a 1d tensor of shape [seq_length...]
     # x is context tokens to add to the kvcache.
@@ -115,7 +122,7 @@ def batched_next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, kwa
     _kwargs = kwargs if isinstance(kwargs, list) else [kwargs] * x.size(0)
 
     # Run the model on the batch.
-    logits_stack = model(x, input_pos)
+    logits_stack = model(x, input_pos=input_pos, pe_pos=pe_pos)
 
     # Unbind the logits stack into a list of logits.
     logits_list = [logits_stack] if logits_stack.ndim == 1 else logits_stack.unbind(0)
@@ -137,6 +144,7 @@ def generate_fn(
     stop_tokens: tuple[list[int], ...] = (),
     include_prompt: bool,
     include_eos: bool,
+    pe_pos: torch.Tensor | None = None,
 ) -> Iterator[torch.Tensor]:
     """
     Generates tokens for a single prompt.
@@ -151,6 +159,7 @@ def generate_fn(
         stop_tokens: A tuple of stop sequences. If any of the sequences are generated, the generation stops early before max_returned_tokens.
         include_prompt: Whether to output the prompt tokens.
         include_eos: Whether to output the stop tokens if generation stops early.
+        pe_pos: Optional multi-coordinate or semantic position tensor (T, L) for positional embeddings.
     """
 
     prompt_size = prompt.size(0)
@@ -180,6 +189,7 @@ def generate_fn(
     # input_pos_maxp1 introduces data-dependent shapes and control flow.
     # We want to skip if ThunderModules are involved, either directly or wrapped in LightningModule etc.
     input_pos_maxp1 = prompt_size if all(m.__class__.__name__ != "ThunderModule" for m in model.modules()) else None
+    current_pe_pos = pe_pos
     for current_idx in range(max_returned_tokens - prompt_size):
         # Generate the token
         token = next_token(
@@ -187,6 +197,7 @@ def generate_fn(
             input_pos,
             token.view(1, -1),
             input_pos_maxp1=input_pos_maxp1,
+            pe_pos=current_pe_pos,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
@@ -228,6 +239,17 @@ def generate_fn(
             input_pos.add_(1)
         if input_pos_maxp1 is not None:
             input_pos_maxp1 += 1
+
+        if pe_pos is not None:
+            if pe_pos.dim() >= 2 and pe_pos.shape[-1] > 1:
+                L = pe_pos.shape[-1]
+                step_pos = torch.zeros((1, L), dtype=torch.int64, device=device)
+                step_pos[0, 0] = input_pos[0]
+                current_pe_pos = step_pos
+            else:
+                current_pe_pos = input_pos
+        else:
+            current_pe_pos = None
 
     # Yield any remaining tokens
     if yielded_idx < len(tokens):
@@ -380,6 +402,7 @@ def generate(
     top_p: float = 1.0,
     eos_id: int | None = None,
     include_prompt: bool = True,
+    pe_pos: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
@@ -407,6 +430,7 @@ def generate(
             or https://huyenchip.com/2024/01/16/sampling.html#top_p
         eos_id: If specified, stop generating any more token once the <eos> token is triggered.
         include_prompt: If true (default) prepends the prompt (after applying the prompt style) to the output.
+        pe_pos: Optional multi-coordinate or semantic position tensor (T, L) for positional embeddings.
     """
 
     token_list = list(
@@ -420,6 +444,7 @@ def generate(
             top_k=top_k,
             top_p=top_p,
             stop_tokens=(([eos_id],) if eos_id is not None else ()),
+            pe_pos=pe_pos,
         )
     )
 

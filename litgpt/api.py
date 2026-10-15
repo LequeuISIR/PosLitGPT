@@ -482,6 +482,7 @@ class LLM(torch.nn.Module):
         top_p: float = 1.0,
         return_as_token_ids: bool = False,
         stream: bool = False,
+        pe_pos: torch.Tensor | None = None,
     ) -> str | torch.Tensor:
         """
         Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
@@ -512,6 +513,7 @@ class LLM(torch.nn.Module):
             stream: If True, returns a generator that yields tokens as they are generated.
                 At the moment, this setting is slower and may use more memory than the non-streaming version.
                 We plan to resolve this in the future.
+            pe_pos: Optional multi-coordinate or semantic position tensor (T, L) for positional embeddings.
         """
         if self.model is None:
             raise AttributeError(
@@ -552,6 +554,7 @@ class LLM(torch.nn.Module):
                 top_k=top_k,
                 top_p=top_p,
                 stop_tokens=([self.preprocessor.tokenizer.eos_id],),
+                pe_pos=pe_pos,
             )
             if return_as_token_ids:
                 yield from outputs
@@ -572,6 +575,7 @@ class LLM(torch.nn.Module):
                 top_p=top_p,
                 eos_id=self.preprocessor.tokenizer.eos_id,
                 include_prompt=False,
+                pe_pos=pe_pos,
             )
 
         if stream:
@@ -660,6 +664,7 @@ class PosLLM(torch.nn.Module):
         self.last_doc_token_positions: torch.Tensor | None = None
         self.last_prompt: str | None = None
         self.last_styled_prompt: str | None = None
+        self.last_pe_pos: torch.Tensor | None = None
 
     """
     LLM model class for inference, pretraining, and finetuning.
@@ -1084,6 +1089,9 @@ class PosLLM(torch.nn.Module):
         segments: list[tuple[str, int | None]] | None = None,
         doc_char_spans: list[tuple[int, int]] | list[tuple[int, int, int]] | None = None,
         return_token_doc_ids: bool = False,
+        document_pe: bool = False,
+        intra_document_pe: bool = False,
+        pe_pos: torch.Tensor | None = None,
     ) -> str | torch.Tensor | tuple[str | torch.Tensor, torch.Tensor]:
         """Takes a conditioning sequence (prompt or segments) and generates output tokens.
 
@@ -1099,6 +1107,9 @@ class PosLLM(torch.nn.Module):
             segments: Optional list of (text_chunk, doc_id) tuples. None or -1 denotes non-document.
             doc_char_spans: Optional list of (start_char, end_char) or (start, end, doc_id) character spans.
             return_token_doc_ids: If True, returns (outputs, token_doc_ids).
+            document_pe: If True, includes document ID coordinate (1-indexed for docs, 0 for non-doc/generated tokens).
+            intra_document_pe: If True, includes intra-document position coordinate (token position within each doc, 0 for non-doc/generated tokens).
+            pe_pos: Optional multi-coordinate or semantic position tensor (T, L) for positional embeddings.
         """
         if self.model is None:
             raise AttributeError(
@@ -1114,11 +1125,19 @@ class PosLLM(torch.nn.Module):
         prompt_length = input_ids.size(0)
         max_returned_tokens = prompt_length + max_new_tokens
 
+        if self.fabric is not None:
+            device = self.fabric.device
+        else:
+            device = self.preprocessor.device
+
+        pe_type = getattr(self.config, "pe_type", "standard_rope")
+        if (document_pe or intra_document_pe) and pe_type not in ("multirope", "multi_rope"):
+            raise ValueError(
+                f"'document_pe' and 'intra_document_pe' require a multi-coordinate positional embedding "
+                f"(pe_type='multirope'), but the model is configured with pe_type='{pe_type}'."
+            )
+
         if not self.kv_cache_initialized:
-            if self.fabric is not None:
-                device = self.fabric.device
-            else:
-                device = self.preprocessor.device
             self.model.set_kv_cache(batch_size=1, max_seq_length=max_returned_tokens, device=device)
             self.kv_cache_initialized = True
 
@@ -1135,6 +1154,42 @@ class PosLLM(torch.nn.Module):
         self.prev_generated_seq_length = max_returned_tokens
         self.model.eval()
 
+        if pe_pos is None:
+            if document_pe or intra_document_pe:
+                global_pos = torch.arange(prompt_length, device=device, dtype=torch.int64)
+                coords = [global_pos]
+                if document_pe:
+                    if self.last_token_doc_ids is not None:
+                        doc_id_pos = torch.where(
+                            self.last_token_doc_ids >= 0,
+                            self.last_token_doc_ids + 1,
+                            torch.zeros_like(self.last_token_doc_ids),
+                        ).to(device=device, dtype=torch.int64)
+                    else:
+                        doc_id_pos = torch.zeros_like(global_pos)
+                    coords.append(doc_id_pos)
+
+                if intra_document_pe:
+                    if self.last_doc_token_positions is not None:
+                        intra_doc_pos = self.last_doc_token_positions.to(device=device, dtype=torch.int64)
+                    else:
+                        intra_doc_pos = torch.zeros_like(global_pos)
+                    coords.append(intra_doc_pos)
+
+                pe_pos = torch.stack(coords, dim=-1)
+            else:
+                pe_pos = None
+        elif pe_pos is not None:
+            if pe_pos.dim() >= 1 and pe_pos.shape[0] != prompt_length:
+                raise ValueError(
+                    f"pe_pos length {pe_pos.shape[0]} does not match prompt length {prompt_length}. "
+                    "Note that prompt styling may have changed the token length. "
+                    "Consider styling your prompt first or using segments."
+                )
+            pe_pos = pe_pos.to(device=device)
+
+        self.last_pe_pos = pe_pos
+
         def iterator():
             outputs = stream_generate_fn(
                 model=self.model,
@@ -1144,6 +1199,7 @@ class PosLLM(torch.nn.Module):
                 top_k=top_k,
                 top_p=top_p,
                 stop_tokens=([self.preprocessor.tokenizer.eos_id],),
+                pe_pos=pe_pos,
             )
             if return_as_token_ids:
                 yield from outputs
@@ -1164,6 +1220,7 @@ class PosLLM(torch.nn.Module):
                 top_p=top_p,
                 eos_id=self.preprocessor.tokenizer.eos_id,
                 include_prompt=False,
+                pe_pos=pe_pos,
             )
 
         if stream:
